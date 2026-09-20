@@ -17,9 +17,10 @@
 | 路灯台账 | 路灯基础档案维护 | 编号/道路/运行状态/灯具类型筛选, 按道路与状态统计, 删除前校验未闭环故障 |
 | 故障登记 | 故障工单登记与流转 | 自动生成故障单号, 紧急程度分级, 状态机流转, 闭环关闭 |
 | 维修记录录入 | 针对故障单登记维修过程 | 自动生成维修单号, 开工/完工时间, 耗材与费用, 四种维修结果 |
-| 维修状态查询 | 只读的综合看板与追踪视图 | 全局概览, 路灯级维修状态列表, 按故障单号/路灯编号的全链路时间线 |
+| 维修质量回访 | 完工后的回访与返修闭环 | 完工自动生成回访单, 记录联系情况与满意度, 不合格触发返修并重新回访, 回访未完成拦截结算 |
+| 维修状态查询 | 只读的综合看板与追踪视图 | 全局概览(含返修次数), 路灯级维修状态列表, 按故障单号/路灯编号的全链路时间线 |
 
-四个模块在后端是四个平级的独立包 (`internal/modules/{lamp,fault,repair,status}`), 在前端是四组独立的视图与子组件, 互不耦合; 新增一个业务模块只需要实现 `module.Module` 接口并注册。
+五个模块在后端是五个平级的独立包 (`internal/modules/{lamp,fault,repair,visit,status}`), 在前端是五组独立的视图与子组件, 互不耦合; 新增一个业务模块只需要实现 `module.Module` 接口并注册。
 
 ---
 
@@ -45,6 +46,7 @@
 │   │   │   ├── lamp/                     #   路灯台账
 │   │   │   ├── fault/                    #   故障登记
 │   │   │   ├── repair/                   #   维修记录录入
+│   │   │   ├── visit/                    #   维修质量回访(完工回访/返修/结算守卫)
 │   │   │   └── status/                   #   维修状态查询(只读, 不建表)
 │   │   ├── response/                     # 统一响应信封 Envelope / PageData / OK / Fail
 │   ├── pkg/pagination/                   # 分页与排序参数(排序字段白名单)
@@ -68,6 +70,7 @@
 │   │       ├── lamp/LampListView.vue + components/LampFormDialog.vue
 │   │       ├── fault/FaultListView.vue + components/{FaultFormDialog,FaultDetailDrawer}.vue
 │   │       ├── repair/RepairListView.vue + components/{RepairFormDialog,FinishRepairDialog}.vue
+│   │       ├── visit/VisitListView.vue + components/{CompleteVisitDialog,VisitDetailDrawer}.vue
 │   │       └── status/{StatusLampView,StatusTrackView}.vue
 │   ├── nginx.conf                        # 生产: SPA 回退 + /api 反向代理
 │   ├── Dockerfile
@@ -105,10 +108,14 @@ modules/<name>/
 lamp.New(db)                                   -> 路灯台账(无依赖)
 fault.New(db, lampService)                     -> 故障登记(读取路灯校验)
 repair.New(db, faultService)                   -> 维修记录(驱动故障状态流转)
-status.New(db, lampRepo, faultRepo, repairRepo)-> 维修状态查询(只读聚合)
+visit.New(db, repairRepo, repairService)       -> 质量回访(完工生成回访, 不合格开出返修单)
+status.New(db, lampRepo, faultRepo, repairRepo, visitRepo) -> 维修状态查询(只读聚合)
 ```
 
-路灯运行状态需要根据故障反向回填, 但 `lamp` 不能依赖 `fault`, 因此用 `lampService.SetOpenFaultCounter(faultModule.Repository())` 注入一个统计端口, 避免构造函数循环依赖。
+两处反向调用通过 setter 注入端口, 避免构造循环依赖:
+
+- 路灯运行状态需根据故障回填: `lampService.SetOpenFaultCounter(faultModule.Repository())`;
+- 维修完工要生成回访、故障关闭(结算)前要校验回访: `repairService.SetVisitHooks(visitService)` 与 `faultService.SetSettlementGuard(visitService)`。
 
 ### 3.3 统一响应与错误
 
@@ -281,16 +288,27 @@ go test ./...
 | GET | `/repairs/fault/:faultId` | 某故障下的全部维修记录 |
 | GET | `/repairs/:id` | 详情 |
 | PUT | `/repairs/:id` | 修改 |
-| POST | `/repairs/:id/finish` | 完工(写入完工时间与维修结果) |
-| DELETE | `/repairs/:id` | 删除(会重算故障的维修次数) |
+| POST | `/repairs/:id/finish` | 完工(写入完工时间与维修结果, 已修复后自动生成回访任务) |
+| DELETE | `/repairs/:id` | 删除(已生成回访的维修单返回 409; 其余会重算故障的维修次数) |
+
+### 维修质量回访
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/visits` | 分页查询(状态/结论/轮次/关键字/生成时间区间) |
+| GET | `/visits/meta` | 字典: 状态/结论/联系结果/联系方式/历史回访人 |
+| GET | `/visits/statistics` | 回访统计(合格率/平均满意度/返修次数) |
+| GET | `/visits/fault/:faultId` | 某故障下的全部回访任务 |
+| GET | `/visits/:id` | 详情(含历次联系记录) |
+| POST | `/visits/:id/complete` | 执行回访(未联系上仅登记; 合格则闭环; 不合格触发返修) |
 
 ### 维修状态查询
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/status/overview` | 全局概览: 台账/故障/维修汇总 + 类型与道路分布 + 逾期清单 |
+| GET | `/status/overview` | 全局概览: 台账/故障/维修/回访汇总(含返修次数) + 类型与道路分布 + 逾期清单 |
 | GET | `/status/lamps` | 路灯级维修状态列表(可只看未闭环) |
-| GET | `/status/track` | 全链路追踪, 参数 `fault_no` 或 `lamp_code` |
+| GET | `/status/track` | 全链路追踪(含回访节点与返修次数), 参数 `fault_no` 或 `lamp_code` |
 
 ---
 
@@ -300,6 +318,15 @@ go test ./...
 - **一灯一单**: 同一路灯同时只允许一条未闭环故障(409); 同一故障同时只允许一条进行中维修记录(409)。
 - **故障状态机**: `待处理 -> 维修中 -> 已修复 -> 已关闭`; 已关闭的故障拒绝任何再操作; 允许 `已修复 -> 维修中` 回退。
 - **维修结果**: 只有 `已修复(fixed)` 会把故障推进到 `已修复`, 其余结果保持 `维修中`。
+- **质量回访规则**:
+  - **完工即回访**: 维修以 `已修复` 完工后, 系统按 `HF + YYYYMMDD + 4 位序号` 自动生成回访单; 非已修复完工不生成。
+  - **联系情况**: 一张回访单可多次联系, 每次联系(已联系上/未联系上、方式、备注)都写入联系记录; 选择"未联系上"时回访单保持 `待回访`。
+  - **满意即合格**: 已联系上时必须给出回访结论与 1-5 分满意度; 结论合格后故障才具备结算条件。
+  - **不合格触发返修**: 结论不合格时必须填写原因, 系统自动开出返修维修单(故障由 `已修复` 回退到 `维修中`), 并通过 `origin_repair_id` 关联首次维修记录; **返修不改写首次维修单的开工/完工时间与处置内容**。
+  - **返修后重新回访**: 返修以已修复完工后, 按轮次递增生成新一轮回访单(其 `origin_repair_id` 仍指向首次维修单), 直到回访合格。
+  - **结算守卫**: 故障关闭(结算)前, 末次维修必须已完工且其回访结论为合格; 回访未完成、不合格返修未闭环或末次维修非已修复时返回 409。
+  - **返修次数进入概览**: 返修次数 = 回访不合格次数, 计入运行看板与 `/status/overview`。
+  - 已生成回访的维修记录不允许删除, 以保证回访/返修链路完整。
 - **路灯运行状态自动联动**: 存在 `维修中` 故障 -> `维修中(maintenance)`; 存在 `待处理` 故障 -> `故障(fault)`; 否则 -> `正常(normal)`; `停用(offline)` 由人工维护。
 - **删除维修记录** 会重算故障的 `repair_count` / `latest_repair_id`, 次数归零时把故障从 `维修中` 回退到 `待处理`。
 - **删除路灯** 会被未闭环故障拦截; **删除故障** 要求已关闭且没有维修记录。
@@ -313,6 +340,7 @@ go test ./...
 
 - 6 条道路, 每条 5 盏路灯, 共 **30 盏**, 覆盖 `正常 / 故障 / 维修中 / 停用` 四种运行状态;
 - **14 条故障**, 覆盖待处理 / 维修中 / 已修复 / 已关闭四种状态, 其中包含 2 条已逾期;
-- **12 条维修记录**, 含进行中与已完工, 带耗材、费用与维修结果。
+- **12 条维修记录**, 含进行中与已完工, 带耗材、费用与维修结果;
+- **8 条质量回访**, 覆盖待回访(含多次未接通)、回访合格、回访不合格 → 返修 → 重新回访合格的完整链路。
 
 想从空库开始, 把 `APP_SEED` 设为 `false`, 或删除数据卷后重启。

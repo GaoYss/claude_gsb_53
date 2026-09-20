@@ -37,6 +37,14 @@
               <el-descriptions-item label="上报人">{{ result.fault.reporter || '-' }}</el-descriptions-item>
               <el-descriptions-item label="上报时间">{{ formatDateTime(result.fault.reported_at) }}</el-descriptions-item>
               <el-descriptions-item label="维修次数">{{ result.fault.repair_count }} 次</el-descriptions-item>
+              <el-descriptions-item label="返修次数">
+                <el-tag size="small" :type="result.rework_count > 0 ? 'danger' : 'info'" effect="plain">
+                  {{ result.rework_count }} 次
+                </el-tag>
+              </el-descriptions-item>
+              <el-descriptions-item label="回访状态">
+                <StatusTag :dict="TRACK_VISIT_STATUS" :value="result.visit_status || 'none'" />
+              </el-descriptions-item>
               <el-descriptions-item label="当前耗时">{{ elapsedText }}</el-descriptions-item>
               <el-descriptions-item label="故障描述" :span="2">{{ result.fault.description || '-' }}</el-descriptions-item>
             </el-descriptions>
@@ -104,6 +112,45 @@
         </el-table>
       </el-card>
 
+      <el-card v-if="result.visits?.length" shadow="never">
+        <div class="section-title">
+          <span>质量回访记录</span>
+          <el-tag size="small" type="info" effect="plain">共 {{ result.visits.length }} 轮, 返修 {{ result.rework_count }} 次</el-tag>
+        </div>
+        <el-table :data="result.visits" size="small" border>
+          <el-table-column prop="visit_no" label="回访单号" width="150" />
+          <el-table-column label="轮次" width="80" align="center">
+            <template #default="{ row }">第 {{ row.round }} 轮</template>
+          </el-table-column>
+          <el-table-column prop="repair_no" label="对应维修单" width="150" />
+          <el-table-column prop="origin_repair_no" label="首次维修单" width="150" />
+          <el-table-column label="状态" width="90">
+            <template #default="{ row }"><StatusTag :dict="VISIT_STATUS" :value="row.status" /></template>
+          </el-table-column>
+          <el-table-column label="结论" width="90">
+            <template #default="{ row }">
+              <StatusTag v-if="row.result" :dict="VISIT_RESULT" :value="row.result" />
+              <span v-else class="text-muted">-</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="满意度" width="120">
+            <template #default="{ row }">
+              <el-rate v-if="row.satisfaction" :model-value="row.satisfaction" disabled />
+              <span v-else class="text-muted">-</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="联系次数" width="80" align="center">
+            <template #default="{ row }">{{ row.contact_attempts || 0 }}</template>
+          </el-table-column>
+          <el-table-column label="回访时间" width="150">
+            <template #default="{ row }">{{ formatDateTime(row.visited_at) }}</template>
+          </el-table-column>
+          <el-table-column prop="unqualified_reason" label="不合格原因" min-width="160" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.unqualified_reason || '-' }}</template>
+          </el-table-column>
+        </el-table>
+      </el-card>
+
       <el-card v-if="result.related_faults?.length" shadow="never">
         <div class="section-title">该路灯的历史故障</div>
         <el-table :data="result.related_faults" size="small">
@@ -145,6 +192,9 @@ import {
   REPAIR_STATUS,
   RUN_STATUS,
   TIMELINE_STAGE,
+  TRACK_VISIT_STATUS,
+  VISIT_RESULT,
+  VISIT_STATUS,
   dictLabel,
   dictType,
 } from '@/constants/dict'

@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"streetlight/internal/modules/fault"
 	"streetlight/internal/modules/lamp"
 	"streetlight/internal/modules/repair"
+	"streetlight/internal/modules/visit"
 	"streetlight/pkg/pagination"
 )
 
@@ -55,11 +57,12 @@ type Service struct {
 	lamps   *lamp.Repository
 	faults  *fault.Repository
 	repairs *repair.Repository
+	visits  *visit.Repository
 }
 
 // NewService 构造维修状态查询服务。
-func NewService(db *gorm.DB, lamps *lamp.Repository, faults *fault.Repository, repairs *repair.Repository) *Service {
-	return &Service{db: db, lamps: lamps, faults: faults, repairs: repairs}
+func NewService(db *gorm.DB, lamps *lamp.Repository, faults *fault.Repository, repairs *repair.Repository, visits *visit.Repository) *Service {
+	return &Service{db: db, lamps: lamps, faults: faults, repairs: repairs, visits: visits}
 }
 
 // Overview 汇总维修状态看板数据。
@@ -136,6 +139,26 @@ func (s *Service) Overview(ctx context.Context) (*Overview, error) {
 		return nil, err
 	}
 
+	visitByStatus, err := s.visits.CountByColumn(ctx, "status")
+	if err != nil {
+		return nil, err
+	}
+	visitByResult, err := s.visits.CountByColumn(ctx, "result")
+	if err != nil {
+		return nil, err
+	}
+	avgSatisfaction, err := s.visits.AverageSatisfaction(ctx)
+	if err != nil {
+		return nil, err
+	}
+	visitCompleted := visitByStatus[visit.StatusCompleted]
+	visitQualified := visitByResult[visit.ResultQualified]
+	visitUnqualified := visitByResult[visit.ResultUnqualified]
+	var qualifiedRate float64
+	if visitCompleted > 0 {
+		qualifiedRate = round2(float64(visitQualified) / float64(visitCompleted))
+	}
+
 	recentFaults, err := s.faults.ListRecent(ctx, 8)
 	if err != nil {
 		return nil, err
@@ -165,6 +188,16 @@ func (s *Service) Overview(ctx context.Context) (*Overview, error) {
 			TodayFinished:     todayFinished,
 			AverageDurationHr: round2(averageDuration),
 			TotalCost:         round2(totalCost),
+		},
+		Visit: VisitSummary{
+			Total:            visitByStatus[visit.StatusPending] + visitCompleted,
+			PendingTotal:     visitByStatus[visit.StatusPending],
+			CompletedTotal:   visitCompleted,
+			QualifiedTotal:   visitQualified,
+			UnqualifiedTotal: visitUnqualified,
+			ReworkTotal:      visitUnqualified,
+			QualifiedRate:    qualifiedRate,
+			AvgSatisfaction:  round2(avgSatisfaction),
 		},
 		FaultByType:   topCounts(faultByType, 0),
 		FaultByLevel:  orderedCounts(faultByLevel, fault.Levels()),
@@ -307,6 +340,7 @@ func (s *Service) Track(ctx context.Context, query TrackQuery) (*TrackResult, er
 			SearchType:    "lamp",
 			Lamp:          device,
 			Repairs:       make([]repair.Repair, 0),
+			Visits:        make([]visit.Visit, 0),
 			Timeline:      make([]TimelineEvent, 0),
 			RelatedFaults: toBriefs(history),
 		}
@@ -316,9 +350,16 @@ func (s *Service) Track(ctx context.Context, query TrackQuery) (*TrackResult, er
 			if err != nil {
 				return nil, err
 			}
+			visits, err := s.visits.ListByFault(ctx, latest.ID)
+			if err != nil {
+				return nil, err
+			}
 			result.Fault = &latest
 			result.Repairs = repairs
-			result.Timeline = buildTimeline(&latest, repairs)
+			result.Visits = visits
+			result.ReworkCount = reworkCount(visits)
+			result.VisitStatus = latestVisitStatus(visits)
+			result.Timeline = buildTimeline(&latest, repairs, visits)
 		}
 		return result, nil
 
@@ -337,12 +378,19 @@ func (s *Service) buildFaultTrack(ctx context.Context, entity *fault.Fault) (*Tr
 	if err != nil {
 		return nil, err
 	}
+	visits, err := s.visits.ListByFault(ctx, entity.ID)
+	if err != nil {
+		return nil, err
+	}
 	return &TrackResult{
-		SearchType: "fault",
-		Lamp:       device,
-		Fault:      entity,
-		Repairs:    repairs,
-		Timeline:   buildTimeline(entity, repairs),
+		SearchType:  "fault",
+		Lamp:        device,
+		Fault:       entity,
+		Repairs:     repairs,
+		Visits:      visits,
+		ReworkCount: reworkCount(visits),
+		VisitStatus: latestVisitStatus(visits),
+		Timeline:    buildTimeline(entity, repairs, visits),
 	}, nil
 }
 
@@ -411,9 +459,10 @@ func (s *Service) latestRepairs(ctx context.Context, lampIDs []uint) (map[uint]r
 	return result, nil
 }
 
-// buildTimeline 依据故障与维修记录构建处置时间线。
-func buildTimeline(entity *fault.Fault, repairs []repair.Repair) []TimelineEvent {
-	events := make([]TimelineEvent, 0, len(repairs)*2+2)
+// buildTimeline 依据故障、维修与回访记录构建处置时间线。
+// 返修的开工/完工作为独立维修记录自然追加, 首次处置过程与原完工时间不会被改写。
+func buildTimeline(entity *fault.Fault, repairs []repair.Repair, visits []visit.Visit) []TimelineEvent {
+	events := make([]TimelineEvent, 0, len(repairs)*2+len(visits)*2+2)
 
 	events = append(events, TimelineEvent{
 		Stage:     "reported",
@@ -449,6 +498,54 @@ func buildTimeline(entity *fault.Fault, repairs []repair.Repair) []TimelineEvent
 		}
 	}
 
+	for _, item := range visits {
+		events = append(events, TimelineEvent{
+			Stage:     "visit_created",
+			Label:     "生成回访任务",
+			Detail:    strings.TrimSpace(item.VisitNo + " 第" + chineseRound(item.Round) + "轮回访"),
+			Timestamp: item.CreatedAt,
+		})
+		if item.VisitedAt != nil {
+			switch item.Result {
+			case visit.ResultQualified:
+				events = append(events, TimelineEvent{
+					Stage:     "visit_qualified",
+					Label:     "回访合格",
+					Operator:  item.Visitor,
+					Detail:    visitDetail(item),
+					Timestamp: *item.VisitedAt,
+				})
+			case visit.ResultUnqualified:
+				events = append(events, TimelineEvent{
+					Stage:     "visit_unqualified",
+					Label:     "回访不合格 · 触发返修",
+					Operator:  item.Visitor,
+					Detail:    visitDetail(item),
+					Timestamp: *item.VisitedAt,
+				})
+			}
+		}
+	}
+
+	// 标记返修开工/完工节点, 与首修区分。
+	reworkRepairs := reworkRepairNos(visits, repairs)
+	for index := range events {
+		if !strings.HasPrefix(events[index].Detail, "WX") {
+			continue
+		}
+		no := repairNoFromDetail(events[index].Detail)
+		if reworkRepairs[no] {
+			switch events[index].Stage {
+			case "repair_started":
+				events[index].Stage = "rework_started"
+				events[index].Label = "返修开工"
+			case "repair_finished":
+				events[index].Stage = "rework_finished"
+				events[index].Label = "返修完成"
+			}
+		}
+	}
+
 	if entity.ClosedAt != nil {
 		events = append(events, TimelineEvent{
 			Stage:     "closed",
@@ -462,6 +559,96 @@ func buildTimeline(entity *fault.Fault, repairs []repair.Repair) []TimelineEvent
 		return events[i].Timestamp.Before(events[j].Timestamp)
 	})
 	return events
+}
+
+// reworkRepairNos 收集由不合格回访触发的返修维修单号。
+func reworkRepairNos(visits []visit.Visit, repairs []repair.Repair) map[string]bool {
+	idToNo := make(map[uint]string, len(repairs))
+	for _, item := range repairs {
+		idToNo[item.ID] = item.RepairNo
+	}
+	result := make(map[string]bool)
+	for _, item := range visits {
+		if item.ReworkRepairID != nil {
+			if no := idToNo[*item.ReworkRepairID]; no != "" {
+				result[no] = true
+			}
+		}
+		// 兜底: 第 2 轮及以后回访对应的维修单也是返修单(种子数据等场景可能未写 rework_repair_id)。
+		if item.Round > 1 {
+			result[item.RepairNo] = true
+		}
+	}
+	return result
+}
+
+// reworkCount 返修次数 = 回访不合格次数。
+func reworkCount(visits []visit.Visit) int {
+	count := 0
+	for _, item := range visits {
+		if item.Result == visit.ResultUnqualified {
+			count++
+		}
+	}
+	return count
+}
+
+// latestVisitStatus 末次回访的总体状态, 供前端快速展示。
+func latestVisitStatus(visits []visit.Visit) string {
+	if len(visits) == 0 {
+		return "none"
+	}
+	latest := visits[len(visits)-1]
+	switch {
+	case latest.Result == visit.ResultQualified:
+		return "qualified"
+	case latest.Result == visit.ResultUnqualified:
+		return "unqualified"
+	default:
+		return "pending"
+	}
+}
+
+// visitDetail 组装回访时间线节点的描述。
+func visitDetail(item visit.Visit) string {
+	var builder strings.Builder
+	if item.Satisfaction != nil {
+		builder.WriteString("满意度 ")
+		builder.WriteString(strconv.Itoa(*item.Satisfaction))
+		builder.WriteString(" 分")
+	}
+	if item.UnqualifiedReason != "" {
+		if builder.Len() > 0 {
+			builder.WriteString("; ")
+		}
+		builder.WriteString("原因: ")
+		builder.WriteString(item.UnqualifiedReason)
+	}
+	if item.Feedback != "" {
+		if builder.Len() > 0 {
+			builder.WriteString("; ")
+		}
+		builder.WriteString(item.Feedback)
+	}
+	return builder.String()
+}
+
+// repairNoFromDetail 从时间线描述前缀中取出维修单号。
+func repairNoFromDetail(detail string) string {
+	fields := strings.Fields(detail)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+// chineseRound 返回回访轮次的中文序数(前 5 轮), 超出部分用阿拉伯数字。
+func chineseRound(round int) string {
+	nums := []string{"", "1", "2", "3", "4", "5"}
+	if round >= 1 && round <= 5 {
+		return nums[round]
+	}
+	return strconv.Itoa(round)
 }
 
 // orderedCounts 按给定顺序输出分组统计, 保证前端展示顺序稳定且包含零值项。

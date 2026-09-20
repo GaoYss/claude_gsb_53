@@ -44,11 +44,50 @@ export const REPAIR_RESULT = {
   unfixable: { label: '无法修复', type: 'danger' },
 }
 
+// 质量回访任务状态。
+export const VISIT_STATUS = {
+  pending: { label: '待回访', type: 'warning' },
+  completed: { label: '已完成', type: 'success' },
+}
+
+// 回访结论。
+export const VISIT_RESULT = {
+  qualified: { label: '合格', type: 'success' },
+  unqualified: { label: '不合格', type: 'danger' },
+}
+
+// 联系结果。
+export const CONTACT_STATUS = {
+  reached: { label: '已联系上', type: 'success' },
+  unreached: { label: '未联系上', type: 'info' },
+}
+
+// 联系方式。
+export const CONTACT_METHOD = {
+  phone: { label: '电话', type: 'primary' },
+  onsite: { label: '现场', type: 'success' },
+  wechat: { label: '微信', type: 'primary' },
+  other: { label: '其它', type: 'info' },
+}
+
+// 追踪视图中末次回访的总体状态。
+export const TRACK_VISIT_STATUS = {
+  none: { label: '未回访', type: 'info' },
+  pending: { label: '待回访', type: 'warning' },
+  qualified: { label: '回访合格', type: 'success' },
+  unqualified: { label: '不合格返修中', type: 'danger' },
+}
+
 // 追踪时间线的节点名称。
 export const TIMELINE_STAGE = {
   reported: { label: '故障登记', type: 'primary' },
   repair_started: { label: '维修开工', type: 'warning' },
   repair_finished: { label: '维修完成', type: 'success' },
+  visit_created: { label: '生成回访任务', type: 'primary' },
+  visit_qualified: { label: '回访合格', type: 'success' },
+  visit_unqualified: { label: '回访不合格 · 触发返修', type: 'danger' },
+  rework_started: { label: '返修开工', type: 'warning' },
+  rework_finished: { label: '返修完成', type: 'success' },
   closed: { label: '故障关闭', type: 'info' },
 }
 

@@ -47,6 +47,22 @@
         :hint="`累计维修记录 ${overview.repair.total} 条`"
       />
       <StatCard
+        label="返修次数"
+        :value="overview.visit.rework_total"
+        suffix="次"
+        icon="RefreshRight"
+        color="#f56c6c"
+        :hint="`回访不合格 ${overview.visit.unqualified_total} 单, 待回访 ${overview.visit.pending_total} 单`"
+      />
+      <StatCard
+        label="回访合格率"
+        :value="visitQualifiedPercent"
+        suffix="%"
+        icon="CircleCheck"
+        color="#67c23a"
+        :hint="`平均满意度 ${overview.visit.avg_satisfaction} 分`"
+      />
+      <StatCard
         label="今日新增故障"
         :value="overview.fault.today_reported"
         suffix="条"
@@ -145,6 +161,7 @@ const emptyOverview = () => ({
   lamp: { total: 0, road_count: 0, by_run_status: {} },
   fault: { total: 0, open_total: 0, by_status: {}, today_reported: 0, overdue_total: 0 },
   repair: { total: 0, ongoing_total: 0, finished_total: 0, today_finished: 0, average_duration_hours: 0, total_cost: 0 },
+  visit: { total: 0, pending_total: 0, completed_total: 0, qualified_total: 0, unqualified_total: 0, rework_total: 0, qualified_rate: 0, avg_satisfaction: 0 },
   fault_by_type: [],
   fault_by_level: [],
   top_roads: [],
@@ -154,6 +171,8 @@ const emptyOverview = () => ({
 })
 
 const overview = ref(emptyOverview())
+
+const visitQualifiedPercent = computed(() => Math.round(Number(overview.value.visit.qualified_rate ?? 0) * 100))
 
 const runStatusItems = computed(() =>
   Object.entries(RUN_STATUS).map(([key, item]) => ({

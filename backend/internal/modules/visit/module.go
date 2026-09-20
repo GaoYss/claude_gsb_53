@@ -1,21 +1,22 @@
-package repair
+package visit
 
 import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
 
-// Module 维修记录模块, 负责维修过程录入与完工闭环。
+// Module 维修质量回访模块: 完工后生成回访任务, 不合格驱动返修, 并守卫故障结算。
 type Module struct {
 	repository *Repository
 	service    *Service
 	handler    *Handler
 }
 
-// New 构造维修记录模块, faults 为故障模块提供的端口实现。
-func New(db *gorm.DB, faults FaultPort) *Module {
+// New 构造质量回访模块。
+// repairs 提供维修单只读能力, factory 用于回访不合格时开出返修维修单。
+func New(db *gorm.DB, repairs RepairReader, factory RepairFactory) *Module {
 	repository := NewRepository(db)
-	service := NewService(repository, faults)
+	service := NewService(repository, repairs, factory)
 	return &Module{
 		repository: repository,
 		service:    service,
@@ -26,27 +27,24 @@ func New(db *gorm.DB, faults FaultPort) *Module {
 // Repository 暴露仓储, 供状态查询模块装配。
 func (m *Module) Repository() *Repository { return m.repository }
 
-// Service 暴露服务, 供质量回访模块作为返修工厂并注入完工钩子。
+// Service 暴露服务, 供 bootstrap 向故障/维修模块注入端口。
 func (m *Module) Service() *Service { return m.service }
 
 // Name 实现 module.Module 接口。
-func (m *Module) Name() string { return "维修记录" }
+func (m *Module) Name() string { return "维修质量回访" }
 
 // Models 实现 module.Module 接口。
-func (m *Module) Models() []any { return []any{&Repair{}} }
+func (m *Module) Models() []any { return []any{&Visit{}, &VisitContact{}} }
 
 // RegisterRoutes 实现 module.Module 接口。
 func (m *Module) RegisterRoutes(api *gin.RouterGroup) {
-	group := api.Group("/repairs")
+	group := api.Group("/visits")
 	{
 		group.GET("", m.handler.List)
-		group.POST("", m.handler.Create)
 		group.GET("/meta", m.handler.Metadata)
 		group.GET("/statistics", m.handler.Statistics)
 		group.GET("/fault/:faultId", m.handler.ListByFault)
 		group.GET("/:id", m.handler.Get)
-		group.PUT("/:id", m.handler.Update)
-		group.POST("/:id/finish", m.handler.Finish)
-		group.DELETE("/:id", m.handler.Delete)
+		group.POST("/:id/complete", m.handler.Complete)
 	}
 }

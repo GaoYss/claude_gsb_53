@@ -6,6 +6,7 @@ import (
 	"streetlight/internal/modules/fault"
 	"streetlight/internal/modules/lamp"
 	"streetlight/internal/modules/repair"
+	"streetlight/internal/modules/visit"
 )
 
 // LabelCount 是通用分组统计项。
@@ -53,11 +54,24 @@ type RepairSummary struct {
 	TotalCost         float64 `json:"total_cost"`
 }
 
+// VisitSummary 维修质量回访概览, ReworkTotal 即返修次数。
+type VisitSummary struct {
+	Total            int64   `json:"total"`
+	PendingTotal     int64   `json:"pending_total"`
+	CompletedTotal   int64   `json:"completed_total"`
+	QualifiedTotal   int64   `json:"qualified_total"`
+	UnqualifiedTotal int64   `json:"unqualified_total"`
+	ReworkTotal      int64   `json:"rework_total"`
+	QualifiedRate    float64 `json:"qualified_rate"`
+	AvgSatisfaction  float64 `json:"avg_satisfaction"`
+}
+
 // Overview 维修状态总览看板。
 type Overview struct {
-	Lamp          LampSummary  `json:"lamp"`
-	Fault         FaultSummary `json:"fault"`
+	Lamp          LampSummary   `json:"lamp"`
+	Fault         FaultSummary  `json:"fault"`
 	Repair        RepairSummary `json:"repair"`
+	Visit         VisitSummary  `json:"visit"`
 	FaultByType   []LabelCount  `json:"fault_by_type"`
 	FaultByLevel  []LabelCount  `json:"fault_by_level"`
 	TopRoads      []LabelCount  `json:"top_roads"`
@@ -101,10 +115,13 @@ type TimelineEvent struct {
 
 // TrackResult 是单条故障(或单盏路灯)的完整处理链路。
 type TrackResult struct {
-	SearchType    string            `json:"search_type"`
-	Lamp          *lamp.Lamp        `json:"lamp,omitempty"`
-	Fault         *fault.Fault      `json:"fault,omitempty"`
-	Repairs       []repair.Repair   `json:"repairs"`
-	Timeline      []TimelineEvent   `json:"timeline"`
-	RelatedFaults []FaultBrief      `json:"related_faults,omitempty"`
+	SearchType    string          `json:"search_type"`
+	Lamp          *lamp.Lamp      `json:"lamp,omitempty"`
+	Fault         *fault.Fault    `json:"fault,omitempty"`
+	Repairs       []repair.Repair `json:"repairs"`
+	Visits        []visit.Visit   `json:"visits"`
+	Timeline      []TimelineEvent `json:"timeline"`
+	RelatedFaults []FaultBrief    `json:"related_faults,omitempty"`
+	ReworkCount   int             `json:"rework_count"`
+	VisitStatus   string          `json:"visit_status"` // 末次回访状态: pending / qualified / unqualified / none
 }

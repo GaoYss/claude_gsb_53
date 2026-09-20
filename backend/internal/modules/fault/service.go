@@ -31,16 +31,26 @@ type LampPort interface {
 	UpdateRunStatus(ctx context.Context, id uint, status string) error
 }
 
+// SettlementGuard 由质量回访模块实现, 故障关闭(结算)前用它校验回访是否已全部合格完成。
+// 返回的 error 非空时阻止关闭。构造后通过 SetSettlementGuard 注入, 避免与回访模块形成循环依赖。
+type SettlementGuard interface {
+	EnsureSettleable(ctx context.Context, faultID uint) error
+}
+
 // Service 承载故障登记的业务规则, 并向维修模块提供故障状态流转能力。
 type Service struct {
-	repo  *Repository
-	lamps LampPort
+	repo            *Repository
+	lamps           LampPort
+	settlementGuard SettlementGuard
 }
 
 // NewService 构造故障登记服务。
 func NewService(repo *Repository, lamps LampPort) *Service {
 	return &Service{repo: repo, lamps: lamps}
 }
+
+// SetSettlementGuard 注入结算前回访校验端口。
+func (s *Service) SetSettlementGuard(guard SettlementGuard) { s.settlementGuard = guard }
 
 // Repository 暴露仓储, 供 bootstrap 装配其它模块所需的端口。
 func (s *Service) Repository() *Repository { return s.repo }
@@ -198,6 +208,13 @@ func (s *Service) Close(ctx context.Context, id uint, req CloseRequest) (*Fault,
 	}
 	if !canTransitTo(entity.Status, StatusClosed) {
 		return nil, apperr.Conflict("故障 %s 当前状态为 %s, 不允许关闭", entity.FaultNo, StatusLabel(entity.Status))
+	}
+
+	// 回访未全部合格完成的故障不允许结算(关闭)。
+	if s.settlementGuard != nil {
+		if err := s.settlementGuard.EnsureSettleable(ctx, entity.ID); err != nil {
+			return nil, err
+		}
 	}
 
 	now := time.Now()

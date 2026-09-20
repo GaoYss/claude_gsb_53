@@ -21,6 +21,14 @@
           <el-descriptions-item label="上报人">{{ detail.fault.reporter || '-' }}</el-descriptions-item>
           <el-descriptions-item label="上报时间">{{ formatDateTime(detail.fault.reported_at) }}</el-descriptions-item>
           <el-descriptions-item label="维修次数">{{ detail.fault.repair_count }} 次</el-descriptions-item>
+          <el-descriptions-item label="返修次数">
+            <el-tag size="small" :type="detail.rework_count > 0 ? 'danger' : 'info'" effect="plain">
+              {{ detail.rework_count ?? 0 }} 次
+            </el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="回访状态">
+            <StatusTag :dict="TRACK_VISIT_STATUS" :value="detail.visit_status || 'none'" />
+          </el-descriptions-item>
           <el-descriptions-item label="故障描述" :span="2">{{ detail.fault.description || '-' }}</el-descriptions-item>
           <el-descriptions-item v-if="detail.fault.closed_at" label="关闭时间" :span="1">
             {{ formatDateTime(detail.fault.closed_at) }}
@@ -73,6 +81,34 @@
           </el-table-column>
           <el-table-column prop="content" label="维修内容" min-width="160" show-overflow-tooltip />
         </el-table>
+
+        <template v-if="detail.visits?.length">
+          <div class="section-title drawer-block">质量回访记录</div>
+          <el-table :data="detail.visits" size="small" border>
+            <el-table-column prop="visit_no" label="回访单号" width="140" />
+            <el-table-column label="轮次" width="70" align="center">
+              <template #default="{ row }">{{ row.round }}</template>
+            </el-table-column>
+            <el-table-column label="状态" width="80">
+              <template #default="{ row }"><StatusTag :dict="VISIT_STATUS" :value="row.status" /></template>
+            </el-table-column>
+            <el-table-column label="结论" width="80">
+              <template #default="{ row }">
+                <StatusTag v-if="row.result" :dict="VISIT_RESULT" :value="row.result" />
+                <span v-else>-</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="满意度" width="90">
+              <template #default="{ row }">{{ row.satisfaction ? `${row.satisfaction} 分` : '-' }}</template>
+            </el-table-column>
+            <el-table-column label="回访时间" width="140">
+              <template #default="{ row }">{{ formatDateTime(row.visited_at) }}</template>
+            </el-table-column>
+            <el-table-column prop="unqualified_reason" label="不合格原因" min-width="140" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.unqualified_reason || '-' }}</template>
+            </el-table-column>
+          </el-table>
+        </template>
       </template>
       <el-empty v-else description="暂无故障数据" />
     </div>
@@ -83,7 +119,7 @@
 import { ref } from 'vue'
 import StatusTag from '@/components/common/StatusTag.vue'
 import { statusApi } from '@/api/status'
-import { FAULT_LEVEL, FAULT_SOURCE, FAULT_STATUS, REPAIR_RESULT, REPAIR_STATUS, RUN_STATUS, TIMELINE_STAGE, dictLabel, dictType } from '@/constants/dict'
+import { FAULT_LEVEL, FAULT_SOURCE, FAULT_STATUS, REPAIR_RESULT, REPAIR_STATUS, RUN_STATUS, TIMELINE_STAGE, TRACK_VISIT_STATUS, VISIT_RESULT, VISIT_STATUS, dictLabel, dictType } from '@/constants/dict'
 import { formatDateTime } from '@/utils/format'
 
 const props = defineProps({

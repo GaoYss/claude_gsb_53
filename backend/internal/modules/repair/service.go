@@ -33,16 +33,27 @@ type FaultPort interface {
 	SyncRepairStats(ctx context.Context, faultID uint, repairCount int, latestRepairID *uint) error
 }
 
+// VisitHooks 由质量回访模块实现, 维修模块在完工后生成回访任务、删除前做拦截。
+// 通过 SetVisitHooks 构造后注入, 避免维修与回访模块循环依赖。
+type VisitHooks interface {
+	OnRepairFinished(ctx context.Context, record *Repair) error
+	EnsureRepairDeletable(ctx context.Context, repairID uint) error
+}
+
 // Service 承载维修记录录入的业务规则。
 type Service struct {
 	repo   *Repository
 	faults FaultPort
+	visits VisitHooks
 }
 
 // NewService 构造维修记录服务。
 func NewService(repo *Repository, faults FaultPort) *Service {
 	return &Service{repo: repo, faults: faults}
 }
+
+// SetVisitHooks 注入质量回访钩子。
+func (s *Service) SetVisitHooks(hooks VisitHooks) { s.visits = hooks }
 
 // Get 查询维修记录详情。
 func (s *Service) Get(ctx context.Context, id uint) (*Repair, error) {
@@ -73,6 +84,17 @@ func (s *Service) ListByFault(ctx context.Context, faultID uint) ([]Repair, erro
 
 // Create 录入维修记录(维修开工), 并联动故障与路灯状态。
 func (s *Service) Create(ctx context.Context, req CreateRequest) (*Repair, error) {
+	return s.create(ctx, req, false)
+}
+
+// CreateRework 质量回访不合格时创建返修维修单。
+// 与普通开工的区别: 允许故障从"已修复"回退到"维修中", 返修单与首次处置同属一条故障,
+// 首次维修单的完工时间与处置过程保持不变。
+func (s *Service) CreateRework(ctx context.Context, req CreateRequest) (*Repair, error) {
+	return s.create(ctx, req, true)
+}
+
+func (s *Service) create(ctx context.Context, req CreateRequest, rework bool) (*Repair, error) {
 	target, err := s.faults.GetByID(ctx, req.FaultID)
 	if err != nil {
 		return nil, err
@@ -80,8 +102,8 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Repair, error
 	if target.Status == fault.StatusClosed {
 		return nil, apperr.Conflict("故障 %s 已关闭, 不允许再登记维修记录", target.FaultNo)
 	}
-	if target.Status == fault.StatusRepaired {
-		return nil, apperr.Conflict("故障 %s 已修复, 如需返修请先登记新的维修记录并重新开工", target.FaultNo)
+	if target.Status == fault.StatusRepaired && !rework {
+		return nil, apperr.Conflict("故障 %s 已修复, 如需返修请通过质量回访不合格流程触发", target.FaultNo)
 	}
 
 	ongoing, err := s.repo.GetOngoingByFault(ctx, target.ID)
@@ -231,6 +253,13 @@ func (s *Service) Finish(ctx context.Context, id uint, req FinishRequest) (*Repa
 		return nil, err
 	}
 
+	// 完工后按规则生成质量回访任务(仅"已修复"), 回访模块不可用时不阻断完工主流程。
+	if s.visits != nil {
+		if err := s.visits.OnRepairFinished(ctx, entity); err != nil {
+			return nil, err
+		}
+	}
+
 	entity.FillDuration()
 	return entity, nil
 }
@@ -247,6 +276,13 @@ func (s *Service) Delete(ctx context.Context, id uint) error {
 	}
 	if target.Status == fault.StatusClosed {
 		return apperr.Conflict("故障 %s 已关闭, 不允许删除其维修记录", target.FaultNo)
+	}
+
+	// 已纳入质量回访的维修记录不允许删除, 保证回访/返修链路完整。
+	if s.visits != nil {
+		if err := s.visits.EnsureRepairDeletable(ctx, id); err != nil {
+			return err
+		}
 	}
 
 	if err := s.repo.Delete(ctx, id); err != nil {

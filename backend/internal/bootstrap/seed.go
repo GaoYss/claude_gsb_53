@@ -10,6 +10,7 @@ import (
 	"streetlight/internal/modules/fault"
 	"streetlight/internal/modules/lamp"
 	"streetlight/internal/modules/repair"
+	"streetlight/internal/modules/visit"
 )
 
 const hour = time.Hour
@@ -24,6 +25,19 @@ type seedRepairCase struct {
 	content     string
 	materials   string
 	cost        float64
+	visitCase   *seedVisitCase // 该维修完工(已修复)后的质量回访场景
+}
+
+// seedVisitCase 描述一条演示回访任务。
+type seedVisitCase struct {
+	visitedAgo       time.Duration // 为 0 表示回访尚未完成(待回访)
+	satisfaction     int
+	qualified        bool
+	reason           string
+	feedback         string
+	visitor          string
+	unreachedAttempt int  // 完成前的未联系上次数
+	reworkNext       bool // 不合格时返修单是否为本故障的下一条维修记录
 }
 
 // seedFaultCase 描述一条演示故障记录。
@@ -142,6 +156,10 @@ func seed(db *gorm.DB) error {
 		}
 	}
 
+	if err := seedVisits(db, now, cases, faults, repairs, repairRanges); err != nil {
+		return err
+	}
+
 	if err := syncSeedLampStatus(db, faults, lamps); err != nil {
 		return err
 	}
@@ -151,6 +169,138 @@ func seed(db *gorm.DB) error {
 		"故障", len(faults),
 		"维修记录", len(repairs),
 	)
+	return nil
+}
+
+// seedVisits 依据维修演示数据生成质量回访任务, 覆盖待回访 / 合格 / 不合格返修后重新回访等场景。
+func seedVisits(db *gorm.DB, now time.Time, cases []seedFaultCase, faults []fault.Fault, repairs []repair.Repair, ranges [][2]int) error {
+	visits := make([]visit.Visit, 0)
+	contacts := make([]visit.VisitContact, 0)
+	sequences := map[string]int{}
+
+	for faultIndex, item := range cases {
+		start, end := ranges[faultIndex][0], ranges[faultIndex][1]
+		round := 0
+		var originRepairID uint
+		var originRepairNo string
+
+		for offset := 0; start+offset < end; offset++ {
+			global := start + offset
+			scenario := item.repairs[offset].visitCase
+			record := repairs[global]
+			if scenario == nil || record.FinishedAt == nil || record.Result != repair.ResultFixed {
+				continue
+			}
+			round++
+			if originRepairID == 0 {
+				originRepairID = record.ID
+				originRepairNo = record.RepairNo
+			}
+
+			prefix := "HF" + record.FinishedAt.Format("20060102")
+			sequences[prefix]++
+			// 回访任务在完工后即刻生成, 创建时间对齐完工时间以保证时间线顺序正确。
+			createdAt := *record.FinishedAt
+			entity := visit.Visit{
+				VisitNo:        fmt.Sprintf("%s%04d", prefix, sequences[prefix]),
+				FaultID:        faults[faultIndex].ID,
+				FaultNo:        record.FaultNo,
+				LampID:         record.LampID,
+				LampCode:       record.LampCode,
+				RepairID:       record.ID,
+				RepairNo:       record.RepairNo,
+				OriginRepairID: originRepairID,
+				OriginRepairNo: originRepairNo,
+				Repairman:      record.Repairman,
+				Round:          round,
+				Status:         visit.StatusPending,
+				CreatedAt:      createdAt,
+				UpdatedAt:      createdAt,
+			}
+
+			// 登记完成前的未联系上记录。
+			for attempt := 0; attempt < scenario.unreachedAttempt; attempt++ {
+				contacts = append(contacts, visit.VisitContact{
+					Result:      visit.ContactUnreached,
+					Method:      visit.MethodPhone,
+					Remark:      "拨打无人接听, 择期再访",
+					ContactedAt: now.Add(-scenario.visitedAgo - time.Duration(attempt+1)*2*hour),
+				})
+			}
+
+			if scenario.visitedAgo > 0 {
+				visitedAt := now.Add(-scenario.visitedAgo)
+				entity.Status = visit.StatusCompleted
+				entity.ContactStatus = visit.ContactReached
+				entity.ContactMethod = visit.MethodPhone
+				entity.Visitor = scenario.visitor
+				entity.VisitedAt = &visitedAt
+				entity.LastContactAt = &visitedAt
+				entity.ContactAttempts = scenario.unreachedAttempt + 1
+				satisfaction := scenario.satisfaction
+				entity.Satisfaction = &satisfaction
+				entity.Feedback = scenario.feedback
+				if scenario.qualified {
+					entity.Result = visit.ResultQualified
+				} else {
+					entity.Result = visit.ResultUnqualified
+					entity.UnqualifiedReason = scenario.reason
+					if scenario.reworkNext && global+1 < end {
+						next := repairs[global+1]
+						entity.ReworkRepairID = &next.ID
+					}
+				}
+				contacts = append(contacts, visit.VisitContact{
+					Result:      visit.ContactReached,
+					Method:      visit.MethodPhone,
+					Remark:      "回访完成",
+					ContactedAt: visitedAt,
+				})
+			} else if scenario.unreachedAttempt > 0 {
+				// 待回访且已有多次未接通记录, 最后联系时间取最近一次(首个 attempt)。
+				lastAttempt := now.Add(-2 * hour)
+				entity.ContactAttempts = scenario.unreachedAttempt
+				entity.LastContactAt = &lastAttempt
+			}
+			visits = append(visits, entity)
+		}
+	}
+
+	if len(visits) == 0 {
+		return nil
+	}
+	if err := db.Create(&visits).Error; err != nil {
+		return fmt.Errorf("写入回访任务演示数据失败: %w", err)
+	}
+
+	// 联系记录按回访顺序回填 visit_id。
+	visitCursor := 0
+	contactCursor := 0
+	for faultIndex, item := range cases {
+		start, end := ranges[faultIndex][0], ranges[faultIndex][1]
+		for offset := 0; start+offset < end; offset++ {
+			scenario := item.repairs[offset].visitCase
+			record := repairs[start+offset]
+			if scenario == nil || record.FinishedAt == nil || record.Result != repair.ResultFixed {
+				continue
+			}
+			visitID := visits[visitCursor].ID
+			count := scenario.unreachedAttempt
+			if scenario.visitedAgo > 0 {
+				count++
+			}
+			for i := 0; i < count; i++ {
+				contacts[contactCursor+i].VisitID = visitID
+			}
+			contactCursor += count
+			visitCursor++
+		}
+	}
+	if len(contacts) > 0 {
+		if err := db.Create(&contacts).Error; err != nil {
+			return fmt.Errorf("写入回访联系记录演示数据失败: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -249,6 +399,8 @@ func seedFaultCases() []seedFaultCase {
 					repairman: "刘志强", team: "市政照明一班", startedAgo: 25 * hour, finishedAgo: 20 * hour,
 					result: repair.ResultFixed, content: "更换 LED 驱动电源并复测绝缘",
 					materials: "驱动电源 1 个", cost: 220,
+					// 完工后已两次未联系上报修人, 回访任务仍待完成。
+					visitCase: &seedVisitCase{unreachedAttempt: 2},
 				},
 			},
 		},
@@ -261,6 +413,22 @@ func seedFaultCases() []seedFaultCase {
 					repairman: "周涛", team: "市政照明二班", startedAgo: 48 * hour, finishedAgo: 44 * hour,
 					result: repair.ResultFixed, content: "更换灯头总成并密封处理",
 					materials: "LED 灯头 1 套", cost: 460,
+					// 首轮回访不合格, 触发返修(下一条维修记录)。
+					visitCase: &seedVisitCase{
+						visitedAgo: 40 * hour, satisfaction: 2, qualified: false,
+						reason: "回访发现灯具仍有渗水痕迹, 夜间亮度不足", visitor: "客服林琳",
+						reworkNext: true,
+					},
+				},
+				{
+					repairman: "周涛", team: "市政照明二班", startedAgo: 36 * hour, finishedAgo: 30 * hour,
+					result: repair.ResultFixed, content: "重新密封灯头并更换防水胶圈, 复测亮度达标",
+					materials: "防水胶圈 2 个, 密封胶 1 支", cost: 120,
+					// 返修完工后重新回访, 结论合格。
+					visitCase: &seedVisitCase{
+						visitedAgo: 24 * hour, satisfaction: 4, qualified: true,
+						feedback: "返修后照明恢复正常", visitor: "客服林琳",
+					},
 				},
 			},
 		},
@@ -273,6 +441,10 @@ func seedFaultCases() []seedFaultCase {
 					repairman: "周涛", team: "市政照明二班", startedAgo: 70 * hour, finishedAgo: 60 * hour,
 					result: repair.ResultFixed, content: "重新浇筑基础法兰并校正灯杆垂直度",
 					materials: "基础法兰 1 套", cost: 980,
+					visitCase: &seedVisitCase{
+						visitedAgo: 55 * hour, satisfaction: 5, qualified: true,
+						feedback: "灯杆已校正, 夜间照明正常", visitor: "客服林琳",
+					},
 				},
 			},
 		},
@@ -285,6 +457,10 @@ func seedFaultCases() []seedFaultCase {
 					repairman: "陈鹏", team: "市政照明一班", startedAgo: 94 * hour, finishedAgo: 90 * hour,
 					result: repair.ResultFixed, content: "更换熔断器并紧固接线端子",
 					materials: "熔断器 1 只", cost: 60,
+					visitCase: &seedVisitCase{
+						visitedAgo: 80 * hour, satisfaction: 5, qualified: true,
+						feedback: "回访确认恢复点亮", visitor: "客服赵颖",
+					},
 				},
 			},
 		},
@@ -297,6 +473,10 @@ func seedFaultCases() []seedFaultCase {
 					repairman: "刘志强", team: "市政照明一班", startedAgo: 118 * hour, finishedAgo: 112 * hour,
 					result: repair.ResultFixed, content: "更换驱动电源, 频闪消除",
 					materials: "驱动电源 1 个", cost: 220,
+					visitCase: &seedVisitCase{
+						visitedAgo: 100 * hour, satisfaction: 4, qualified: true,
+						feedback: "频闪问题未再出现", visitor: "客服赵颖",
+					},
 				},
 			},
 		},
@@ -309,11 +489,16 @@ func seedFaultCases() []seedFaultCase {
 					repairman: "周涛", team: "市政照明二班", startedAgo: 148 * hour, finishedAgo: 140 * hour,
 					result: repair.ResultPendingParts, content: "检测确认需整段更换电缆, 等待物料到场",
 					materials: "电缆 40 米", cost: 120,
+					// 非已修复完工, 不生成回访任务。
 				},
 				{
 					repairman: "周涛", team: "市政照明二班", startedAgo: 130 * hour, finishedAgo: 120 * hour,
 					result: repair.ResultFixed, content: "更换老化电缆并做绝缘测试, 测试合格",
 					materials: "电缆 40 米, 热缩管 4 套", cost: 1560,
+					visitCase: &seedVisitCase{
+						visitedAgo: 110 * hour, satisfaction: 5, qualified: true,
+						feedback: "连续观察一周运行稳定", visitor: "客服林琳",
+					},
 				},
 			},
 		},
@@ -326,6 +511,8 @@ func seedFaultCases() []seedFaultCase {
 					repairman: "陈鹏", team: "市政照明二班", startedAgo: 9 * hour, finishedAgo: 7 * hour,
 					result: repair.ResultFixed, content: "更换接触器, 恢复远程开关灯控制",
 					materials: "交流接触器 1 只", cost: 150,
+					// 刚完工, 回访任务刚生成、尚未联系。
+					visitCase: &seedVisitCase{},
 				},
 			},
 		},
