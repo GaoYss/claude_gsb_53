@@ -10,6 +10,7 @@ import (
 	"streetlight/internal/modules/fault"
 	"streetlight/internal/modules/lamp"
 	"streetlight/internal/modules/repair"
+	"streetlight/internal/modules/visit"
 )
 
 const hour = time.Hour
@@ -24,6 +25,7 @@ type seedRepairCase struct {
 	content     string
 	materials   string
 	cost        float64
+	isRework    bool // 是否为回访不合格触发的返修单
 }
 
 // seedFaultCase 描述一条演示故障记录。
@@ -37,6 +39,7 @@ type seedFaultCase struct {
 	reportedAgo time.Duration
 	status      string
 	closed      bool
+	visitState  string // 回访场景: 空/qualified=合格, contacted=已联系待评定, pending=待回访(超期), rework=返修链路
 	repairs     []seedRepairCase
 }
 
@@ -126,6 +129,38 @@ func seed(db *gorm.DB) error {
 		}
 	}
 
+	// 回填返修单与原维修记录的关联(返修是独立的新记录, 原记录保持不变)。
+	for index, item := range cases {
+		if item.visitState != "rework" {
+			continue
+		}
+		start := repairRanges[index][0]
+		originalID := repairs[start].ID
+		for offset, expect := range item.repairs {
+			if !expect.isRework {
+				continue
+			}
+			reworkID := repairs[start+offset].ID
+			if err := db.Model(&repair.Repair{}).Where("id = ?", reworkID).
+				Update("original_repair_id", originalID).Error; err != nil {
+				return fmt.Errorf("回填返修关联失败: %w", err)
+			}
+		}
+	}
+
+	visits := buildSeedVisits(now, cases, faults, repairs, repairRanges)
+	if len(visits) > 0 {
+		if err := db.Create(&visits).Error; err != nil {
+			return fmt.Errorf("写入质量回访演示数据失败: %w", err)
+		}
+		visitLogs := buildSeedVisitLogs(now, visits)
+		if len(visitLogs) > 0 {
+			if err := db.Create(&visitLogs).Error; err != nil {
+				return fmt.Errorf("写入回访联系记录演示数据失败: %w", err)
+			}
+		}
+	}
+
 	for index, item := range cases {
 		start, end := repairRanges[index][0], repairRanges[index][1]
 		columns := map[string]any{"repair_count": end - start}
@@ -152,6 +187,166 @@ func seed(db *gorm.DB) error {
 		"维修记录", len(repairs),
 	)
 	return nil
+}
+
+// buildSeedVisits 依据故障的回访场景生成演示回访任务。
+//
+// 覆盖: qualified=合格闭环; contacted=已联系待评定; overdue=超期未回访;
+// rework=首轮不合格触发返修、返修后重新回访合格(两轮)。
+func buildSeedVisits(now time.Time, cases []seedFaultCase, faults []fault.Fault, repairs []repair.Repair, ranges [][2]int) []visit.Visit {
+	result := make([]visit.Visit, 0)
+	sequences := map[string]int{}
+
+	newVisit := func(base repair.Repair, round int, dueAt time.Time) visit.Visit {
+		prefixDate := base.StartedAt
+		createdAt := base.StartedAt
+		if base.FinishedAt != nil {
+			prefixDate = *base.FinishedAt
+			createdAt = *base.FinishedAt
+		}
+		prefix := "HF" + prefixDate.Format("20060102")
+		sequences[prefix]++
+		return visit.Visit{
+			VisitNo:  fmt.Sprintf("%s%04d", prefix, sequences[prefix]),
+			FaultID:  base.FaultID,
+			FaultNo:  base.FaultNo,
+			LampID:   base.LampID,
+			LampCode: base.LampCode,
+			RepairID: base.ID,
+			RepairNo: base.RepairNo,
+			Round:    round,
+			DueAt:    dueAt,
+			Status:   visit.StatusPending,
+			CreatedAt: createdAt,
+			UpdatedAt: createdAt,
+		}
+	}
+
+	for index, item := range cases {
+		state := item.visitState
+		if state == "" {
+			continue
+		}
+		start, end := ranges[index][0], ranges[index][1]
+		caseRepairs := repairs[start:end]
+
+		// 找到最近一次"已修复完工"的维修记录作为回访对象。
+		lastFixed := -1
+		for offset := len(caseRepairs) - 1; offset >= 0; offset-- {
+			if caseRepairs[offset].Status == repair.StatusFinished && caseRepairs[offset].Result == repair.ResultFixed {
+				lastFixed = offset
+				break
+			}
+		}
+		if lastFixed < 0 || caseRepairs[lastFixed].FinishedAt == nil {
+			continue
+		}
+		fixedRecord := caseRepairs[lastFixed]
+		dueAt := fixedRecord.FinishedAt.Add(visit.DefaultDeadline)
+
+		switch state {
+		case "rework":
+			// 首轮回访不合格, 关联返修单。
+			first := newVisit(caseRepairs[0], 1, caseRepairs[0].FinishedAt.Add(visit.DefaultDeadline))
+			contactedAt := now.Add(-19 * hour)
+			score := 2
+			unqualified := false
+			first.Status = visit.StatusUnqualified
+			first.ContactResult = visit.ContactConnected
+			first.ContactName = "张伟"
+			first.ContactPhone = "13800001234"
+			first.ContactedAt = &contactedAt
+			first.Satisfaction = &score
+			first.Qualified = &unqualified
+			first.Content = "回访发现当晚仍有灯具不亮, 维修效果未达预期"
+			reworkID := fixedRecord.ID
+			first.ReworkRepairID = &reworkID
+			first.ReworkRepairNo = fixedRecord.RepairNo
+			result = append(result, first)
+
+			// 返修完工后第二轮回访合格。
+			second := newVisit(fixedRecord, 2, dueAt)
+			contactedAt2 := now.Add(-13 * hour)
+			score2 := 5
+			qualified := true
+			second.Status = visit.StatusQualified
+			second.ContactResult = visit.ContactConnected
+			second.ContactName = "张伟"
+			second.ContactPhone = "13800001234"
+			second.ContactedAt = &contactedAt2
+			second.Satisfaction = &score2
+			second.Qualified = &qualified
+			second.Content = "返修后连续两晚照明正常, 回访合格"
+			result = append(result, second)
+
+		case "qualified":
+			entity := newVisit(fixedRecord, 1, dueAt)
+			contactedAt := fixedRecord.FinishedAt.Add(2 * time.Hour)
+			score := 5
+			qualified := true
+			entity.Status = visit.StatusQualified
+			entity.ContactResult = visit.ContactConnected
+			entity.ContactName = item.reporter
+			entity.ContactPhone = "13800001234"
+			entity.ContactedAt = &contactedAt
+			entity.Satisfaction = &score
+			entity.Qualified = &qualified
+			entity.Content = "现场已恢复正常, 对维修结果满意"
+			result = append(result, entity)
+
+		case "contacted":
+			entity := newVisit(fixedRecord, 1, dueAt)
+			contactedAt := now.Add(-2 * hour)
+			entity.Status = visit.StatusContacted
+			entity.ContactResult = visit.ContactDeferred
+			entity.ContactName = item.reporter
+			entity.ContactPhone = "13800001234"
+			entity.ContactedAt = &contactedAt
+			entity.Content = "已联系, 居民表示晚间再观察一晚, 约定明日评定"
+			result = append(result, entity)
+
+		case "overdue":
+			// 完工已超过回访期限仍未联系, 任务保持待回访且 due_at 在过去。
+			entity := newVisit(fixedRecord, 1, dueAt)
+			result = append(result, entity)
+		}
+	}
+	return result
+}
+
+// buildSeedVisitLogs 为已产生联系的回访任务补充联系情况明细, 与任务结论保持一致。
+func buildSeedVisitLogs(now time.Time, visits []visit.Visit) []visit.VisitContactLog {
+	logs := make([]visit.VisitContactLog, 0, len(visits))
+	for _, item := range visits {
+		if item.ContactedAt == nil {
+			continue
+		}
+		result := item.ContactResult
+		if result == "" {
+			result = visit.ContactConnected
+		}
+		logs = append(logs, visit.VisitContactLog{
+			VisitID:       item.ID,
+			ContactResult: result,
+			ContactName:   item.ContactName,
+			ContactPhone:  item.ContactPhone,
+			Content:       item.Content,
+			ContactedAt:   *item.ContactedAt,
+		})
+
+		// 不合格场景补一条首次未接通的联系记录, 体现多次联系过程。
+		if item.Status == visit.StatusUnqualified {
+			logs = append(logs, visit.VisitContactLog{
+				VisitID:       item.ID,
+				ContactResult: visit.ContactNoAnswer,
+				ContactName:   item.ContactName,
+				ContactPhone:  item.ContactPhone,
+				Content:       "首次拨打无人接听",
+				ContactedAt:   item.ContactedAt.Add(-30 * time.Minute),
+			})
+		}
+	}
+	return logs
 }
 
 // buildSeedLamps 生成 6 条道路共 30 盏路灯的台账数据。
@@ -243,19 +438,24 @@ func seedFaultCases() []seedFaultCase {
 		{
 			lampIndex: 5, faultType: "灯不亮", level: fault.LevelNormal, source: fault.SourceCitizen,
 			description: "该灯杆夜间不亮, 疑似驱动电源损坏", reporter: "张伟",
-			reportedAgo: 26 * hour, status: fault.StatusRepaired,
+			reportedAgo: 26 * hour, status: fault.StatusRepaired, visitState: "rework",
 			repairs: []seedRepairCase{
 				{
 					repairman: "刘志强", team: "市政照明一班", startedAgo: 25 * hour, finishedAgo: 20 * hour,
 					result: repair.ResultFixed, content: "更换 LED 驱动电源并复测绝缘",
 					materials: "驱动电源 1 个", cost: 220,
 				},
+				{
+					repairman: "刘志强", team: "市政照明一班", startedAgo: 18 * hour, finishedAgo: 14 * hour,
+					result: repair.ResultFixed, content: "返修: 复检发现接线端子松动, 重新压接并试亮",
+					materials: "接线端子 2 个", cost: 30, isRework: true,
+				},
 			},
 		},
 		{
 			lampIndex: 6, faultType: "灯具破损", level: fault.LevelNormal, source: fault.SourceInspection,
 			description: "灯具外罩被外物击碎, 需整体更换灯头", reporter: "王建国",
-			reportedAgo: 50 * hour, status: fault.StatusRepaired,
+			reportedAgo: 50 * hour, status: fault.StatusRepaired, visitState: "qualified",
 			repairs: []seedRepairCase{
 				{
 					repairman: "周涛", team: "市政照明二班", startedAgo: 48 * hour, finishedAgo: 44 * hour,
@@ -267,7 +467,7 @@ func seedFaultCases() []seedFaultCase {
 		{
 			lampIndex: 7, faultType: "灯杆倾斜", level: fault.LevelHigh, source: fault.SourceCitizen,
 			description: "车辆剐蹭导致灯杆倾斜约 8 度, 存在安全隐患", reporter: "孙倩",
-			reportedAgo: 72 * hour, status: fault.StatusClosed, closed: true,
+			reportedAgo: 72 * hour, status: fault.StatusClosed, closed: true, visitState: "qualified",
 			repairs: []seedRepairCase{
 				{
 					repairman: "周涛", team: "市政照明二班", startedAgo: 70 * hour, finishedAgo: 60 * hour,
@@ -279,7 +479,7 @@ func seedFaultCases() []seedFaultCase {
 		{
 			lampIndex: 8, faultType: "灯不亮", level: fault.LevelNormal, source: fault.SourceMonitoring,
 			description: "平台告警该灯杆回路电流为零", reporter: "监控中心",
-			reportedAgo: 96 * hour, status: fault.StatusClosed, closed: true,
+			reportedAgo: 96 * hour, status: fault.StatusClosed, closed: true, visitState: "qualified",
 			repairs: []seedRepairCase{
 				{
 					repairman: "陈鹏", team: "市政照明一班", startedAgo: 94 * hour, finishedAgo: 90 * hour,
@@ -291,7 +491,7 @@ func seedFaultCases() []seedFaultCase {
 		{
 			lampIndex: 9, faultType: "灯光闪烁", level: fault.LevelNormal, source: fault.SourceInspection,
 			description: "灯具有明显频闪, 疑似驱动电源老化", reporter: "王建国",
-			reportedAgo: 120 * hour, status: fault.StatusClosed, closed: true,
+			reportedAgo: 120 * hour, status: fault.StatusClosed, closed: true, visitState: "qualified",
 			repairs: []seedRepairCase{
 				{
 					repairman: "刘志强", team: "市政照明一班", startedAgo: 118 * hour, finishedAgo: 112 * hour,
@@ -303,7 +503,7 @@ func seedFaultCases() []seedFaultCase {
 		{
 			lampIndex: 10, faultType: "线路故障", level: fault.LevelUrgent, source: fault.SourceInspection,
 			description: "地埋电缆绝缘老化, 绝缘电阻不达标", reporter: "赵强",
-			reportedAgo: 150 * hour, status: fault.StatusClosed, closed: true,
+			reportedAgo: 150 * hour, status: fault.StatusClosed, closed: true, visitState: "qualified",
 			repairs: []seedRepairCase{
 				{
 					repairman: "周涛", team: "市政照明二班", startedAgo: 148 * hour, finishedAgo: 140 * hour,
@@ -320,7 +520,7 @@ func seedFaultCases() []seedFaultCase {
 		{
 			lampIndex: 11, faultType: "灯具常亮", level: fault.LevelLow, source: fault.SourceOther,
 			description: "白天常亮, 疑似接触器粘连", reporter: "社区网格员",
-			reportedAgo: 10 * hour, status: fault.StatusRepaired,
+			reportedAgo: 10 * hour, status: fault.StatusRepaired, visitState: "contacted",
 			repairs: []seedRepairCase{
 				{
 					repairman: "陈鹏", team: "市政照明二班", startedAgo: 9 * hour, finishedAgo: 7 * hour,
@@ -342,6 +542,18 @@ func seedFaultCases() []seedFaultCase {
 				{
 					repairman: "刘志强", team: "市政照明一班", startedAgo: 12 * hour,
 					content: "拆检控制箱, 正在逐路测量回路电流", materials: "万用表、绝缘胶带", cost: 40,
+				},
+			},
+		},
+		{
+			lampIndex: 14, faultType: "灯不亮", level: fault.LevelNormal, source: fault.SourceCitizen,
+			description: "灯具时亮时灭, 已更换光源但仍未回访确认", reporter: "周敏",
+			reportedAgo: 60 * hour, status: fault.StatusRepaired, visitState: "overdue",
+			repairs: []seedRepairCase{
+				{
+					repairman: "陈鹏", team: "市政照明二班", startedAgo: 58 * hour, finishedAgo: 54 * hour,
+					result: repair.ResultFixed, content: "更换灯具光源模组并试亮",
+					materials: "LED 光源模组 1 套", cost: 190,
 				},
 			},
 		},

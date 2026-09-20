@@ -195,6 +195,28 @@ func (r *Repository) CountByFault(ctx context.Context, faultID uint) (int64, err
 	return count, nil
 }
 
+// CountRework 统计返修单数量(关联了原维修记录的维修记录)。
+func (r *Repository) CountRework(ctx context.Context) (int64, error) {
+	var count int64
+	err := r.session(ctx).Model(&Repair{}).Where("original_repair_id IS NOT NULL").Count(&count).Error
+	if err != nil {
+		return 0, fmt.Errorf("统计返修数量失败: %w", err)
+	}
+	return count, nil
+}
+
+// ExistsReworkFor 判断某条维修记录是否已被返修单引用, 用于删除保护。
+func (r *Repository) ExistsReworkFor(ctx context.Context, originalRepairID uint) (bool, error) {
+	var count int64
+	err := r.session(ctx).Model(&Repair{}).
+		Where("original_repair_id = ?", originalRepairID).
+		Count(&count).Error
+	if err != nil {
+		return false, fmt.Errorf("查询返修引用失败: %w", err)
+	}
+	return count > 0, nil
+}
+
 // CountByColumn 按列分组统计。
 func (r *Repository) CountByColumn(ctx context.Context, column string) (map[string]int64, error) {
 	type row struct {

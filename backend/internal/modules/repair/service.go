@@ -33,10 +33,16 @@ type FaultPort interface {
 	SyncRepairStats(ctx context.Context, faultID uint, repairCount int, latestRepairID *uint) error
 }
 
+// VisitHook 由质量回访模块实现, 维修完工(已修复)后据此自动生成回访任务。
+type VisitHook interface {
+	OnRepairFinished(ctx context.Context, repairID uint) error
+}
+
 // Service 承载维修记录录入的业务规则。
 type Service struct {
 	repo   *Repository
 	faults FaultPort
+	visits VisitHook
 }
 
 // NewService 构造维修记录服务。
@@ -44,9 +50,17 @@ func NewService(repo *Repository, faults FaultPort) *Service {
 	return &Service{repo: repo, faults: faults}
 }
 
+// SetVisitHook 注入质量回访模块的完工钩子, 避免维修模块反向依赖回访模块。
+func (s *Service) SetVisitHook(hook VisitHook) { s.visits = hook }
+
 // Get 查询维修记录详情。
 func (s *Service) Get(ctx context.Context, id uint) (*Repair, error) {
 	return s.repo.GetByID(ctx, id)
+}
+
+// CountRework 统计返修单总数。
+func (s *Service) CountRework(ctx context.Context) (int64, error) {
+	return s.repo.CountRework(ctx)
 }
 
 // List 分页查询维修记录。
@@ -231,6 +245,88 @@ func (s *Service) Finish(ctx context.Context, id uint, req FinishRequest) (*Repa
 		return nil, err
 	}
 
+	// 维修完工且判定已修复后, 按规则自动生成质量回访任务。
+	if result == ResultFixed && s.visits != nil {
+		if err := s.visits.OnRepairFinished(ctx, entity.ID); err != nil {
+			return nil, err
+		}
+	}
+
+	entity.FillDuration()
+	return entity, nil
+}
+
+// CreateRework 登记返修: 回访判定不合格时, 基于原维修记录创建一条全新的维修记录,
+// 通过 OriginalRepairID 关联原记录, 并把故障从"已修复"回退到"维修中"。
+// 原维修记录的开工/完工时间与首次处置过程均不被改写。
+func (s *Service) CreateRework(ctx context.Context, originalRepairID uint, req ReworkRequest) (*Repair, error) {
+	original, err := s.repo.GetByID(ctx, originalRepairID)
+	if err != nil {
+		return nil, err
+	}
+	if original.Status != StatusFinished {
+		return nil, apperr.Conflict("维修记录 %s 尚未完工, 不允许发起返修", original.RepairNo)
+	}
+
+	target, err := s.faults.GetByID(ctx, original.FaultID)
+	if err != nil {
+		return nil, err
+	}
+	if target.Status == fault.StatusClosed {
+		return nil, apperr.Conflict("故障 %s 已关闭, 不允许返修", target.FaultNo)
+	}
+
+	ongoing, err := s.repo.GetOngoingByFault(ctx, target.ID)
+	if err != nil {
+		return nil, err
+	}
+	if ongoing != nil {
+		return nil, apperr.Conflict("故障 %s 已有进行中的维修记录 %s, 请先完成后再返修", target.FaultNo, ongoing.RepairNo)
+	}
+
+	repairman := strings.TrimSpace(req.Repairman)
+	if repairman == "" {
+		repairman = original.Repairman
+	}
+
+	startedAt, err := parseTime(req.StartedAt, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	if original.FinishedAt != nil && startedAt.Before(*original.FinishedAt) {
+		return nil, apperr.BadRequest("返修开工时间不能早于原维修完工时间 %s", original.FinishedAt.Format("2006-01-02 15:04:05"))
+	}
+
+	entity := &Repair{
+		FaultID:          target.ID,
+		FaultNo:          target.FaultNo,
+		LampID:           target.LampID,
+		LampCode:         target.LampCode,
+		Repairman:        repairman,
+		RepairTeam:       strings.TrimSpace(req.RepairTeam),
+		ContactPhone:     strings.TrimSpace(req.ContactPhone),
+		StartedAt:        startedAt,
+		Status:           StatusOngoing,
+		Content:          strings.TrimSpace(req.Content),
+		Remark:           strings.TrimSpace(req.Remark),
+		OriginalRepairID: &original.ID,
+	}
+	if entity.RepairTeam == "" {
+		entity.RepairTeam = original.RepairTeam
+	}
+	if entity.ContactPhone == "" {
+		entity.ContactPhone = original.ContactPhone
+	}
+
+	if err := s.repo.CreateWithUniqueNo(ctx, entity, "WX"+startedAt.Format("20060102")); err != nil {
+		return nil, err
+	}
+
+	// 返修开工: 故障由"已修复"回退为"维修中", 维修次数累加, 路灯回到维修状态。
+	if err := s.faults.OnRepairStarted(ctx, target.ID, entity.ID); err != nil {
+		return nil, err
+	}
+
 	entity.FillDuration()
 	return entity, nil
 }
@@ -247,6 +343,14 @@ func (s *Service) Delete(ctx context.Context, id uint) error {
 	}
 	if target.Status == fault.StatusClosed {
 		return apperr.Conflict("故障 %s 已关闭, 不允许删除其维修记录", target.FaultNo)
+	}
+
+	referenced, err := s.repo.ExistsReworkFor(ctx, id)
+	if err != nil {
+		return err
+	}
+	if referenced {
+		return apperr.Conflict("维修记录 %s 已被返修单关联, 不允许删除", entity.RepairNo)
 	}
 
 	if err := s.repo.Delete(ctx, id); err != nil {

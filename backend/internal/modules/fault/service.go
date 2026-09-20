@@ -31,15 +31,27 @@ type LampPort interface {
 	UpdateRunStatus(ctx context.Context, id uint, status string) error
 }
 
+// SettlementChecker 由质量回访模块实现, 在故障关闭(结算)前校验回访是否已合格闭环。
+// 返回错误时拒绝结算, 保证"回访未完成的故障不允许结算"。
+type SettlementChecker interface {
+	CheckSettlement(ctx context.Context, faultID uint) error
+}
+
 // Service 承载故障登记的业务规则, 并向维修模块提供故障状态流转能力。
 type Service struct {
-	repo  *Repository
-	lamps LampPort
+	repo              *Repository
+	lamps             LampPort
+	settlementChecker SettlementChecker
 }
 
 // NewService 构造故障登记服务。
 func NewService(repo *Repository, lamps LampPort) *Service {
 	return &Service{repo: repo, lamps: lamps}
+}
+
+// SetSettlementChecker 注入结算前校验端口(质量回访模块), 避免故障模块反向依赖回访模块。
+func (s *Service) SetSettlementChecker(checker SettlementChecker) {
+	s.settlementChecker = checker
 }
 
 // Repository 暴露仓储, 供 bootstrap 装配其它模块所需的端口。
@@ -198,6 +210,13 @@ func (s *Service) Close(ctx context.Context, id uint, req CloseRequest) (*Fault,
 	}
 	if !canTransitTo(entity.Status, StatusClosed) {
 		return nil, apperr.Conflict("故障 %s 当前状态为 %s, 不允许关闭", entity.FaultNo, StatusLabel(entity.Status))
+	}
+
+	// 结算前校验: 维修已完工的故障必须回访合格, 回访未完成不允许结算。
+	if s.settlementChecker != nil {
+		if err := s.settlementChecker.CheckSettlement(ctx, id); err != nil {
+			return nil, err
+		}
 	}
 
 	now := time.Now()

@@ -14,12 +14,14 @@ import (
 	"streetlight/internal/modules/lamp"
 	"streetlight/internal/modules/repair"
 	"streetlight/internal/modules/status"
+	"streetlight/internal/modules/visit"
 )
 
 type harness struct {
 	lamps   *lamp.Service
 	faults  *fault.Service
 	repairs *repair.Service
+	visits  *visit.Service
 	status  *status.Service
 }
 
@@ -36,7 +38,7 @@ func newHarness(t *testing.T) *harness {
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 
-	require.NoError(t, db.AutoMigrate(&lamp.Lamp{}, &fault.Fault{}, &repair.Repair{}))
+	require.NoError(t, db.AutoMigrate(&lamp.Lamp{}, &fault.Fault{}, &repair.Repair{}, &visit.Visit{}, &visit.VisitContactLog{}))
 
 	lampRepository := lamp.NewRepository(db)
 	lampService := lamp.NewService(lampRepository)
@@ -48,12 +50,35 @@ func newHarness(t *testing.T) *harness {
 	repairRepository := repair.NewRepository(db)
 	repairService := repair.NewService(repairRepository, faultService)
 
+	visitRepository := visit.NewRepository(db)
+	visitService := visit.NewService(visitRepository, repairService)
+	repairService.SetVisitHook(visitService)
+	faultService.SetSettlementChecker(visitService)
+
 	return &harness{
 		lamps:   lampService,
 		faults:  faultService,
 		repairs: repairService,
-		status:  status.NewService(db, lampRepository, faultRepository, repairRepository),
+		visits:  visitService,
+		status:  status.NewService(db, lampRepository, faultRepository, repairRepository, visitRepository),
 	}
+}
+
+// qualifyVisit 将某故障的最新一轮回访评定为合格, 使故障满足结算条件。
+func (h *harness) qualifyVisit(t *testing.T, faultID uint) {
+	t.Helper()
+	list, err := h.visits.ListByFault(context.Background(), faultID)
+	require.NoError(t, err)
+	require.NotEmpty(t, list, "完工后应自动生成回访任务")
+	qualified := true
+	_, err = h.visits.Evaluate(context.Background(), list[len(list)-1].ID, visit.EvaluateRequest{
+		ContactResult: visit.ContactConnected,
+		ContactName:   "市民",
+		Satisfaction:  5,
+		Qualified:     &qualified,
+		Content:       "回访测试通过",
+	})
+	require.NoError(t, err)
 }
 
 func (h *harness) createLamp(t *testing.T, code, road string) *lamp.Lamp {
@@ -101,6 +126,7 @@ func TestOverviewAggregatesBusinessState(t *testing.T) {
 	cost := 180.0
 	_, err = h.repairs.Finish(ctx, record.ID, repair.FinishRequest{Result: repair.ResultFixed, Cost: &cost})
 	require.NoError(t, err)
+	h.qualifyVisit(t, closedFault.ID)
 	_, err = h.faults.Close(ctx, closedFault.ID, fault.CloseRequest{Remark: "闭环"})
 	require.NoError(t, err)
 
@@ -139,6 +165,7 @@ func TestLampStatusListAndTrack(t *testing.T) {
 	require.NoError(t, err)
 	_, err = h.repairs.Finish(ctx, record.ID, repair.FinishRequest{Result: repair.ResultFixed})
 	require.NoError(t, err)
+	h.qualifyVisit(t, closedFault.ID)
 	_, err = h.faults.Close(ctx, closedFault.ID, fault.CloseRequest{Remark: "闭环"})
 	require.NoError(t, err)
 
@@ -170,11 +197,14 @@ func TestLampStatusListAndTrack(t *testing.T) {
 	require.NotNil(t, track.Lamp)
 	require.Equal(t, closedLamp.Code, track.Lamp.Code)
 	require.Len(t, track.Repairs, 1)
-	require.Len(t, track.Timeline, 4)
+	require.Len(t, track.Visits, 1)
+	require.Len(t, track.Timeline, 6)
 	require.Equal(t, "reported", track.Timeline[0].Stage)
 	require.Equal(t, "repair_started", track.Timeline[1].Stage)
 	require.Equal(t, "repair_finished", track.Timeline[2].Stage)
-	require.Equal(t, "closed", track.Timeline[3].Stage)
+	require.Equal(t, "visit_created", track.Timeline[3].Stage)
+	require.Equal(t, "visit_qualified", track.Timeline[4].Stage)
+	require.Equal(t, "closed", track.Timeline[5].Stage)
 
 	byLamp, err := h.status.Track(ctx, status.TrackQuery{LampCode: closedLamp.Code})
 	require.NoError(t, err)

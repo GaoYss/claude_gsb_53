@@ -44,11 +44,41 @@ export const REPAIR_RESULT = {
   unfixable: { label: '无法修复', type: 'danger' },
 }
 
+// 质量回访任务状态。
+export const VISIT_STATUS = {
+  pending: { label: '待回访', type: 'info' },
+  contacted: { label: '已联系待评定', type: 'warning' },
+  qualified: { label: '回访合格', type: 'success' },
+  unqualified: { label: '回访不合格', type: 'danger' },
+}
+
+// 回访联系结果。
+export const VISIT_CONTACT = {
+  connected: { label: '已联系上', type: 'success' },
+  no_answer: { label: '无人接听', type: 'warning' },
+  unreachable: { label: '无法接通', type: 'danger' },
+  deferred: { label: '约定再联', type: 'primary' },
+}
+
+// 满意度等级(1-5 分)。
+export const SATISFACTION = {
+  1: { label: '很不满意', type: 'danger' },
+  2: { label: '不满意', type: 'warning' },
+  3: { label: '一般', type: 'info' },
+  4: { label: '满意', type: 'primary' },
+  5: { label: '非常满意', type: 'success' },
+}
+
 // 追踪时间线的节点名称。
 export const TIMELINE_STAGE = {
   reported: { label: '故障登记', type: 'primary' },
   repair_started: { label: '维修开工', type: 'warning' },
   repair_finished: { label: '维修完成', type: 'success' },
+  rework_started: { label: '返修开工', type: 'warning' },
+  rework_finished: { label: '返修完工', type: 'success' },
+  visit_created: { label: '生成回访任务', type: 'info' },
+  visit_qualified: { label: '回访合格', type: 'success' },
+  visit_unqualified: { label: '回访不合格·触发返修', type: 'danger' },
   closed: { label: '故障关闭', type: 'info' },
 }
 

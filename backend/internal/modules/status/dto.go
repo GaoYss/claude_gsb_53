@@ -6,6 +6,7 @@ import (
 	"streetlight/internal/modules/fault"
 	"streetlight/internal/modules/lamp"
 	"streetlight/internal/modules/repair"
+	"streetlight/internal/modules/visit"
 )
 
 // LabelCount 是通用分组统计项。
@@ -49,15 +50,29 @@ type RepairSummary struct {
 	OngoingTotal      int64   `json:"ongoing_total"`
 	FinishedTotal     int64   `json:"finished_total"`
 	TodayFinished     int64   `json:"today_finished"`
+	ReworkTotal       int64   `json:"rework_total"` // 返修次数
 	AverageDurationHr float64 `json:"average_duration_hours"`
 	TotalCost         float64 `json:"total_cost"`
 }
 
+// VisitSummary 维修质量回访概览。
+type VisitSummary struct {
+	Total            int64   `json:"total"`
+	PendingTotal     int64   `json:"pending_total"`
+	QualifiedTotal   int64   `json:"qualified_total"`
+	UnqualifiedTotal int64   `json:"unqualified_total"`
+	OverdueTotal     int64   `json:"overdue_total"`
+	ReworkTotal      int64   `json:"rework_total"`
+	QualifiedRate    float64 `json:"qualified_rate"`
+	AverageScore     float64 `json:"average_score"`
+}
+
 // Overview 维修状态总览看板。
 type Overview struct {
-	Lamp          LampSummary  `json:"lamp"`
-	Fault         FaultSummary `json:"fault"`
+	Lamp          LampSummary   `json:"lamp"`
+	Fault         FaultSummary  `json:"fault"`
 	Repair        RepairSummary `json:"repair"`
+	Visit         VisitSummary  `json:"visit"`
 	FaultByType   []LabelCount  `json:"fault_by_type"`
 	FaultByLevel  []LabelCount  `json:"fault_by_level"`
 	TopRoads      []LabelCount  `json:"top_roads"`
@@ -101,10 +116,11 @@ type TimelineEvent struct {
 
 // TrackResult 是单条故障(或单盏路灯)的完整处理链路。
 type TrackResult struct {
-	SearchType    string            `json:"search_type"`
-	Lamp          *lamp.Lamp        `json:"lamp,omitempty"`
-	Fault         *fault.Fault      `json:"fault,omitempty"`
-	Repairs       []repair.Repair   `json:"repairs"`
-	Timeline      []TimelineEvent   `json:"timeline"`
-	RelatedFaults []FaultBrief      `json:"related_faults,omitempty"`
+	SearchType    string          `json:"search_type"`
+	Lamp          *lamp.Lamp      `json:"lamp,omitempty"`
+	Fault         *fault.Fault    `json:"fault,omitempty"`
+	Repairs       []repair.Repair `json:"repairs"`
+	Visits        []visit.Visit   `json:"visits"`
+	Timeline      []TimelineEvent `json:"timeline"`
+	RelatedFaults []FaultBrief    `json:"related_faults,omitempty"`
 }

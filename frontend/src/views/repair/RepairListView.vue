@@ -33,7 +33,12 @@
 
     <el-card shadow="never">
       <el-table v-loading="loading" :data="rows" stripe>
-        <el-table-column prop="repair_no" label="维修单号" width="140" fixed="left" />
+        <el-table-column label="维修单号" width="160" fixed="left">
+          <template #default="{ row }">
+            {{ row.repair_no }}
+            <el-tag v-if="row.original_repair_id" type="warning" size="small" effect="plain">返修</el-tag>
+          </template>
+        </el-table-column>
         <el-table-column prop="fault_no" label="故障单号" width="140" />
         <el-table-column prop="lamp_code" label="路灯编号" width="110" />
         <el-table-column prop="repairman" label="维修人员" width="100" />
@@ -106,7 +111,7 @@ const router = useRouter()
 const dictStore = useDictStore()
 
 const { loading, rows, total, query, load, search, reset, changePage, changePageSize } = useListPage(repairApi.list, {
-  keyword: '',
+  keyword: route.query.keyword ? String(route.query.keyword) : '',
   status: '',
   result: '',
   repairman: '',

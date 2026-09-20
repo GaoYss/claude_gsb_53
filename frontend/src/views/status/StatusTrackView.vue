@@ -79,7 +79,12 @@
       <el-card shadow="never">
         <div class="section-title">维修记录明细</div>
         <el-table :data="result.repairs" size="small" border>
-          <el-table-column prop="repair_no" label="维修单号" width="150" />
+          <el-table-column label="维修单号" width="170">
+            <template #default="{ row }">
+              {{ row.repair_no }}
+              <el-tag v-if="row.original_repair_id" type="warning" size="small" effect="plain">返修</el-tag>
+            </template>
+          </el-table-column>
           <el-table-column prop="repairman" label="维修人员" width="110" />
           <el-table-column prop="repair_team" label="班组" width="140" />
           <el-table-column label="状态" width="100">
@@ -102,6 +107,34 @@
             <template #default="{ row }">{{ formatMoney(row.cost) }}</template>
           </el-table-column>
         </el-table>
+      </el-card>
+
+      <el-card shadow="never">
+        <div class="section-title">回访记录</div>
+        <el-table v-if="result.visits?.length" :data="result.visits" size="small" border>
+          <el-table-column prop="visit_no" label="回访单号" width="150" />
+          <el-table-column label="轮次" width="70" align="center">
+            <template #default="{ row }">第{{ row.round }}轮</template>
+          </el-table-column>
+          <el-table-column prop="repair_no" label="对应维修单" width="150" />
+          <el-table-column label="状态" width="120">
+            <template #default="{ row }"><StatusTag :dict="VISIT_STATUS" :value="row.status" /></template>
+          </el-table-column>
+          <el-table-column label="满意度" width="140">
+            <template #default="{ row }">
+              <el-rate v-if="row.satisfaction" :model-value="row.satisfaction" disabled />
+              <span v-else class="text-muted">-</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="回访期限" width="150">
+            <template #default="{ row }">{{ formatDateTime(row.due_at) }}</template>
+          </el-table-column>
+          <el-table-column label="返修单" width="150">
+            <template #default="{ row }">{{ row.rework_repair_no || '-' }}</template>
+          </el-table-column>
+          <el-table-column prop="content" label="回访情况" min-width="160" show-overflow-tooltip />
+        </el-table>
+        <el-empty v-else description="暂无回访记录" :image-size="80" />
       </el-card>
 
       <el-card v-if="result.related_faults?.length" shadow="never">
@@ -145,6 +178,7 @@ import {
   REPAIR_STATUS,
   RUN_STATUS,
   TIMELINE_STAGE,
+  VISIT_STATUS,
   dictLabel,
   dictType,
 } from '@/constants/dict'

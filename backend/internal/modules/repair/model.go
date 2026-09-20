@@ -56,6 +56,10 @@ type Repair struct {
 	Cost         float64    `json:"cost"`
 	Remark       string     `gorm:"size:255" json:"remark"`
 
+	// OriginalRepairID 返修单指向被返修的原维修记录; 首次维修为空。
+	// 返修生成的是一条全新的维修记录, 原记录的开工/完工时间与处置过程保持不变。
+	OriginalRepairID *uint `gorm:"index" json:"original_repair_id,omitempty"`
+
 	// DurationMinutes 仅用于响应展示的维修耗时(分钟), 不落库。
 	DurationMinutes *int64 `gorm:"-" json:"duration_minutes,omitempty"`
 

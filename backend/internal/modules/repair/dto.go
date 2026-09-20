@@ -37,6 +37,16 @@ type FinishRequest struct {
 	Remark     string   `json:"remark" binding:"omitempty,max=255"`
 }
 
+// ReworkRequest 返修开工请求, 回访不合格时基于原维修记录发起。
+type ReworkRequest struct {
+	Repairman    string `json:"repairman" binding:"omitempty,max=64"` // 留空默认沿用原维修人员
+	RepairTeam   string `json:"repair_team" binding:"omitempty,max=64"`
+	ContactPhone string `json:"contact_phone" binding:"omitempty,max=32"`
+	StartedAt    string `json:"started_at" binding:"omitempty,max=32"`
+	Content      string `json:"content" binding:"omitempty,max=512"`
+	Remark       string `json:"remark" binding:"omitempty,max=255"`
+}
+
 // ListQuery 维修记录查询条件。
 type ListQuery struct {
 	pagination.Params
